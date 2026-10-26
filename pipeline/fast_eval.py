@@ -1,0 +1,115 @@
+"""Batched evaluation: runs whole sequences through the network at once (seconds instead of
+the ~15 min row-by-row loop) and scores them with the official GlobalAccumulator.
+
+    python -m pipeline.fast_eval --baseline                 # should reproduce 0.617052
+    python -m pipeline.fast_eval --ckpt runs/NAME/best.pt --holdout 500
+"""
+import argparse
+import json
+import time
+
+import numpy as np
+import torch
+
+from utils import SEQUENCE_LENGTH, WARMUP, GlobalAccumulator
+
+from .data import SeqStore, split_train
+from .model import build_net, load_baseline, needs_extra
+
+NEED = np.arange(SEQUENCE_LENGTH) >= WARMUP
+
+
+def pick_device(name="auto"):
+    if name != "auto":
+        return torch.device(name)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def with_extras(X):
+    """Append the extra causal features (pipeline/features.py) to raw inputs [B,T,112]."""
+    from .features import offline
+    return np.concatenate([X, offline(X)], -1)
+
+
+@torch.no_grad()
+def predict_batch(net, X, device, chunk=2000):
+    if needs_extra(net) and X.shape[-1] == 112:
+        X = with_extras(X)
+    B, T, _ = X.shape
+    out = np.empty((B, T, 2), np.float32)
+    h = xp = None
+    for s in range(0, T, chunk):
+        x = torch.from_numpy(X[:, s:s + chunk]).to(device)
+        p, h = net(x, h, xp)
+        xp = x[:, -1]
+        out[:, s:s + chunk] = p.float().cpu().numpy()
+    return out
+
+
+def evaluate_many(nets, store: SeqStore, ids, device, batch_size=128):
+    """Score several models in one pass over the data. Per model:
+    {'scored': WP on scored rows, 'all': WP on all required rows, ...} (equal without a mask)."""
+    for net in nets:
+        net.eval()
+    accs = [(GlobalAccumulator(), GlobalAccumulator()) for _ in nets]
+    extra = any(needs_extra(n) for n in nets)
+    for X, Y, M in store.batches(list(ids), batch_size):
+        X = with_extras(X) if extra else X  # once per batch, shared by every model that uses them
+        for net, (acc, acc_all) in zip(nets, accs):
+            P = predict_batch(net, X, device)
+            for b in range(len(X)):
+                acc.add(Y[b], P[b], M[b])
+                if store.has_mask:
+                    acc_all.add(Y[b], P[b], NEED)
+    out = []
+    for acc, acc_all in accs:
+        r = acc.result()
+        res = {"scored": r["weighted_pearson"], "t0": r["t0"], "t1": r["t1"], "n_seqs": r["blocks"]}
+        res["all"] = acc_all.result()["weighted_pearson"] if store.has_mask else res["scored"]
+        out.append(res)
+    return out
+
+
+def evaluate(net, store: SeqStore, ids, device, batch_size=128):
+    return evaluate_many([net], store, ids, device, batch_size)[0]
+
+
+def load_ckpt(path):
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    net = build_net(ck["config"])
+    net.load_state_dict(ck["state_dict"])
+    return net
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--baseline", action="store_true")
+    g.add_argument("--ckpt")
+    ap.add_argument("--valid-seqs", type=int, default=None, help="first N validation seqs (default all)")
+    ap.add_argument("--holdout", type=int, default=0, help="also score the N-seq train holdout")
+    ap.add_argument("--valid-split", help="split.json from mask_model: score validation half B instead")
+    ap.add_argument("--device", default="auto")
+    args = ap.parse_args()
+
+    device = pick_device(args.device)
+    net = (load_baseline("baseline/baseline.onnx") if args.baseline else load_ckpt(args.ckpt)).to(device)
+    out = {}
+    t = time.time()
+    valid = SeqStore("datasets/valid.parquet")
+    ids = json.load(open(args.valid_split))["B"] if args.valid_split else list(range(valid.n_seqs))
+    out["valid_B" if args.valid_split else "valid"] = evaluate(net, valid, ids[:args.valid_seqs or len(ids)], device)
+    if args.holdout:
+        train = SeqStore("datasets/train.parquet")
+        _, hold = split_train(train.n_seqs, args.holdout)
+        out["holdout"] = evaluate(net, train, hold, device)
+    out["seconds"] = round(time.time() - t, 1)
+    print(json.dumps(out, indent=1))
+
+
+if __name__ == "__main__":
+    main()

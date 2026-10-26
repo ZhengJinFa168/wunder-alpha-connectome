@@ -1,0 +1,7 @@
+.venv/
+datasets/
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
+*.tar.gz
+runs/reservoir_B_preds.npy
