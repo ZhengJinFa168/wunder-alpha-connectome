@@ -1,12 +1,14 @@
-# Alfa Connectome: ML competition by Wunder Fund
+# Wunder Alpha Connectome
 
-Our solution for Wunder Fund's Alpha Connectome competition (deadline Nov 15, 2026): predict `t0` and `t1`, two
+Our solution for Wunder Fund's Alpha Connectome competition (deadline Nov 15, 2026; public leaderboard rank
+**251 of 5,760, top 4.4%**): predict `t0` and `t1`, two
 indicators of future price moves of instrument `i0`, one row at a time from 112 order-book, trade and extra features.
 The organisers' original README is kept at the end ([Competition reference](#competition-reference)).
 
 ## Final submission
 
-**`sweep11_mix.zip`: leaderboard 0.66021** (rank 251 of 5,760 on Nov 8, 2026; organisers' baseline 0.59353),
+**`sweep11_mix.zip`: leaderboard 0.66021** (rank 251 of 5,760, top 4.4%, public leaderboard on Nov 8, 2026;
+organisers' baseline 0.59353),
 31 minutes on the grader (limit 60). One 2-layer, 128-unit GRU per instrument group, picked per sequence:
 
 | Group (tick size) | Model | Trained on |
