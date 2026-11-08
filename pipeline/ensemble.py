@@ -23,8 +23,8 @@ import numpy as np
 from utils import SEQUENCE_LENGTH, WARMUP, weighted_pearson
 
 from .data import SeqStore, split_train
-from .fast_eval import load_ckpt, pick_device, predict_batch, with_extras
-from .model import BASELINE_MACS, EnsembleNet, export_onnx, load_baseline, macs, needs_extra
+from .fast_eval import load_ckpt, net_inputs, pick_device, predict_batch
+from .model import BASELINE_MACS, EnsembleNet, export_onnx, feat_kind, load_baseline, macs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 NEED = np.arange(SEQUENCE_LENGTH) >= WARMUP
@@ -40,14 +40,13 @@ def collect(nets, store, ids, device, masks):
     """-> Y {mask: [N,2]}, P {mask: [K,N,2]} for masks 'all' (required rows) and/or 'scored'."""
     ys = {m: [] for m in masks}
     ps = {m: [[] for _ in nets] for m in masks}
-    extra = any(needs_extra(n) for n in nets)
     for X, Y, M in store.batches(list(ids), 128):
-        X = with_extras(X) if extra else X
+        cache = {}  # extras once per batch and kind
         sel = {"all": np.broadcast_to(NEED, M.shape), "scored": M}
         for m in masks:
             ys[m].append(Y[sel[m]])
         for k, net in enumerate(nets):
-            P = predict_batch(net, X, device)
+            P = predict_batch(net, net_inputs(net, X, cache), device)
             for m in masks:
                 ps[m][k].append(P[sel[m]])
     return ({m: np.concatenate(ys[m]) for m in masks},
@@ -173,9 +172,12 @@ def main():
             out = os.path.join(args.export, f"cost{b:g}", "submission")
             os.makedirs(out, exist_ok=True)
             net = nets[chosen[0]] if len(chosen) == 1 else EnsembleNet([nets[k] for k in chosen], scales[chosen])
-            export_onnx(net, os.path.join(out, "model.onnx"))
-            shutil.copy(os.path.join(HERE, "solution_template.py"), os.path.join(out, "solution.py"))
-            shutil.copy(os.path.join(HERE, "features.py"), os.path.join(out, "wnn_features.py"))
+            if len({feat_kind(nets[k]) for k in chosen} - {None}) <= 1:
+                export_onnx(net, os.path.join(out, "model.onnx"))
+                shutil.copy(os.path.join(HERE, "solution_template.py"), os.path.join(out, "solution.py"))
+                shutil.copy(os.path.join(HERE, "features.py"), os.path.join(out, "wnn_features.py"))
+            else:
+                print(f"cost<={b:g}: members use different extra features, no ONNX (ensemble.json only, e.g. for a teacher)")
             row = next(r for r in rows if r["combo"] == f"greedy, cost <= {b:g}")
             json.dump({"members": [paths[k] for k in chosen], "scales": scales[chosen].tolist(),
                        "scores": {k: (float(v) if isinstance(v, (float, np.floating)) else v) for k, v in row.items()}},

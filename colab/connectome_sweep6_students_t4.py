@@ -73,6 +73,8 @@ for f, pairs in PATCHES.items():
         t = t.replace(a, b)
     open(f'/content/wnn/{f}', 'w').write(t)
 import importlib, sys; sys.path.insert(0, '/content/wnn')
+for m in [m for m in sys.modules if m == 'pipeline' or m.startswith('pipeline.')]:
+    del sys.modules[m]  # a previous run in this session may have loaded the old code
 from pipeline.trainer import ExpConfig
 assert 'micro_batch' in ExpConfig.__dataclass_fields__
 print('patched:', ', '.join(PATCHES))

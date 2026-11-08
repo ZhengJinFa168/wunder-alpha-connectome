@@ -1,13 +1,30 @@
 # Alpha Connectome, sweep 7: training dynamics (9 GRUs) + TCN & minGRU teachers (4 models)
 # One-cell launcher: takes the base pipeline from connectome_sweep6.ipynb in Drive and writes the updated
 # model.py / trainer.py / fast_eval.py / ensemble.py (minGRU, causal TCN, per-model mini-batches, correlation table).
-# 13 mask-weighted models (lambda 0.5, no teacher), 4 passes, judged on validation half B
+# 13 mask-weighted models (lambda 0.5, no teacher), 4 passes, judged on validation half B; models that already
+# have results in runs/sweep7 are skipped (the 9 GRUs finished on 2026-10-28).
 # (reference: sweep 5 plain_m50 = 0.6755). Keep this tab open while it runs. Full version: colab/connectome_sweep7.ipynb.
 import os, subprocess, sys
 from google.colab import drive
 drive.mount('/content/drive')
 OUT_DIR = '/content/drive/MyDrive/wunder-connectome/runs'
 os.makedirs(OUT_DIR, exist_ok=True)
+
+def drive_writable():
+    """Drive can turn read-only (storage full, or the mount drops during the 30-min download): check before writing."""
+    for attempt in range(2):
+        try:
+            with open(f'{OUT_DIR}/.write_test', 'w') as f: f.write('ok')
+            os.remove(f'{OUT_DIR}/.write_test'); print('Drive is writable', flush=True); return
+        except OSError as e:
+            print(f'Drive not writable ({e}), remounting', flush=True)
+            try: drive.flush_and_unmount()
+            except Exception: pass
+            drive.mount('/content/drive', force_remount=True)
+    raise RuntimeError('Google Drive is read-only: most likely its storage is full. Free space (and empty the Drive '
+                       'Trash) at drive.google.com/settings/storage, then re-run this cell; the dataset stays on this machine.')
+
+drive_writable()
 
 def sh(cmd):
     p = subprocess.Popen(cmd, shell=True, executable='/bin/bash', stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -63,6 +80,8 @@ UPDATES = {'pipeline/model.py': '"""Stateful sequence models (GRU/LSTM, minGRU, 
 for rel, body in UPDATES.items():
     open(f'/content/wnn/{rel}', 'w').write(body)
 import importlib; sys.path.insert(0, '/content/wnn')
+for m in [m for m in sys.modules if m == 'pipeline' or m.startswith('pipeline.')]:
+    del sys.modules[m]  # a previous run in this session may have loaded the old code
 from pipeline.trainer import ExpConfig
 from pipeline.model import MinGRUNet, TCNNet
 assert 'arch' in ExpConfig.__dataclass_fields__ and 'micro_batch' in ExpConfig.__dataclass_fields__
@@ -102,10 +121,13 @@ experiments = [{'name': 'b256_c500', 'mask_weight': 0.5},
   'layers': 7,
   'kernel': 3,
   'chunk': 2000}]
-json.dump(experiments, open('experiments.json', 'w'), indent=1)
-print(len(experiments), 'experiments')
 SWEEP = f'{OUT_DIR}/sweep7'
-sh(f"""set -o pipefail; cd /content/wnn && python -m pipeline.multi_train --config experiments.json --epochs 4 --evals-per-epoch 1 --threads 8 --cache-eval --row-weights {ROWW} --valid-split {SPLIT} --out-dir {SWEEP} 2>&1 | grep -v '"event": "batch"'""")
+done = [e['name'] for e in experiments if os.path.exists(f"{SWEEP}/{e['name']}/results.json")]
+experiments = [e for e in experiments if e['name'] not in done]  # re-runnable: finished models are skipped
+json.dump(experiments, open('experiments.json', 'w'), indent=1)
+print(len(experiments), 'experiments to train' + (f', already done: {done}' if done else ''))
+drive_writable()  # again: the mount can drop during the long download
+if experiments: sh(f"""set -o pipefail; cd /content/wnn && python -m pipeline.multi_train --config experiments.json --epochs 4 --evals-per-epoch 1 --threads 8 --cache-eval --row-weights {ROWW} --valid-split {SPLIT} --out-dir {SWEEP} 2>&1 | grep -v '"event": "batch"'""")
 import pandas as pd
 rows = [json.loads(l) for l in open(f'{SWEEP}/summary.jsonl')]
 df = pd.DataFrame(rows).drop_duplicates('name', keep='last')

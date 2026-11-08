@@ -14,7 +14,8 @@ import torch
 from utils import SEQUENCE_LENGTH, WARMUP, GlobalAccumulator
 
 from .data import SeqStore, split_train
-from .model import build_net, load_baseline, needs_extra
+from .groups import label as group_label
+from .model import build_net, feat_kind, load_baseline
 
 NEED = np.arange(SEQUENCE_LENGTH) >= WARMUP
 
@@ -29,16 +30,24 @@ def pick_device(name="auto"):
     return torch.device("cpu")
 
 
-def with_extras(X):
-    """Append the extra causal features (pipeline/features.py) to raw inputs [B,T,112]."""
+def with_extras(X, kind="act"):
+    """Append the extra causal features of `kind` (pipeline/features.py) to raw inputs [B,T,112]."""
     from .features import offline
-    return np.concatenate([X, offline(X)], -1)
+    return np.concatenate([X, offline(X[..., :112], kind)], -1)
+
+
+def net_inputs(net, X, cache):
+    """Raw batch X [B,T,112] -> what `net` takes; `cache` (a dict per batch) shares the extras between models."""
+    kind = feat_kind(net)
+    if kind and kind not in cache:
+        cache[kind] = with_extras(X, kind)
+    return cache[kind] if kind else X
 
 
 @torch.no_grad()
 def predict_batch(net, X, device, chunk=2000):
-    if needs_extra(net) and X.shape[-1] == 112:
-        X = with_extras(X)
+    if X.shape[-1] == 112:
+        X = net_inputs(net, X, {})
     B, T, _ = X.shape
     out = np.empty((B, T, 2), np.float32)
     h = xp = None
@@ -56,19 +65,23 @@ def evaluate_many(nets, store: SeqStore, ids, device, batch_size=128):
     for net in nets:
         net.eval()
     accs = [(GlobalAccumulator(), GlobalAccumulator()) for _ in nets]
-    extra = any(needs_extra(n) for n in nets)
+    acc_g = [[GlobalAccumulator() for _ in range(4)] for _ in nets]  # scored rows per instrument group
     for X, Y, M in store.batches(list(ids), batch_size):
-        X = with_extras(X) if extra else X  # once per batch, shared by every model that uses them
-        for net, (acc, acc_all) in zip(nets, accs):
-            P = predict_batch(net, X, device)
+        cache = {}  # extras once per batch and kind, shared by every model that uses them
+        groups = group_label(Y)
+        for net, (acc, acc_all), ag in zip(nets, accs, acc_g):
+            P = predict_batch(net, net_inputs(net, X, cache), device)
             for b in range(len(X)):
                 acc.add(Y[b], P[b], M[b])
+                ag[groups[b]].add(Y[b], P[b], M[b])
                 if store.has_mask:
                     acc_all.add(Y[b], P[b], NEED)
     out = []
-    for acc, acc_all in accs:
+    for (acc, acc_all), ag in zip(accs, acc_g):
         r = acc.result()
         res = {"scored": r["weighted_pearson"], "t0": r["t0"], "t1": r["t1"], "n_seqs": r["blocks"]}
+        for g, a in enumerate(ag):  # nan when the eval set has no sequence of that group
+            res[f"scored_g{g}"] = a.result()["weighted_pearson"] if a.selected_rows else float("nan")
         res["all"] = acc_all.result()["weighted_pearson"] if store.has_mask else res["scored"]
         out.append(res)
     return out

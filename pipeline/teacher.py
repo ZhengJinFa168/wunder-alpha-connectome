@@ -21,8 +21,7 @@ import numpy as np
 import torch
 
 from .data import SeqStore
-from .fast_eval import load_ckpt, pick_device, predict_batch, with_extras
-from .model import EnsembleNet, needs_extra
+from .fast_eval import load_ckpt, net_inputs, pick_device, predict_batch
 
 
 def main():
@@ -60,10 +59,9 @@ def main():
     if args.limit:
         out[args.limit:] = 0
     t, done = time.time(), 0
-    extra = any(needs_extra(n) for n in nets)
     for X, _, _ in store.batches(ids, 128):
-        X = with_extras(X) if extra else X
-        P = np.stack([predict_batch(net, X, device) for net in nets])  # [K, B, T, 2]
+        cache = {}  # each member gets its own extra features, computed once per batch and kind
+        P = np.stack([predict_batch(net, net_inputs(net, X, cache), device) for net in nets])  # [K, B, T, 2]
         if scales is None:  # common spread, fixed from the first batch
             sd = P[:, :, 99:].std(axis=(1, 2))  # [K, 2]
             scales = sd.mean(0, keepdims=True) / sd
