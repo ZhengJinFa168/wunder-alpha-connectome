@@ -8,6 +8,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .features import kind_for_width
+
 N_FEATURES = 112
 CLIP = 2.0
 
@@ -26,20 +28,52 @@ def _model_inputs(x, x_prev, use_diff, n_extra):
     return torch.cat(parts, -1) if len(parts) > 1 else base
 
 
+class StateHead(nn.Module):
+    """Output head over a group's joint target states (groups.state_values): softmax over K states, prediction =
+    the |y|-weighted-MSE optimum under that distribution, per target sum_k p_k v_k |v_k| / sum_k p_k |v_k|.
+    Keeps the last logits in `last_logits` for the state cross-entropy (trainer, ExpConfig.cls)."""
+
+    def __init__(self, hidden, values):
+        super().__init__()
+        self.logits = nn.Linear(hidden, len(values))
+        v = torch.tensor(values, dtype=torch.float32)
+        self.register_buffer("num", v * v.abs(), persistent=False)
+        self.register_buffer("den", v.abs(), persistent=False)
+        self.register_buffer("values", v, persistent=False)
+        self.last_logits = None
+
+    def forward(self, z):
+        lg = self.logits(z)
+        self.last_logits = lg
+        p = torch.softmax(lg, -1)
+        return (p @ self.num) / (p @ self.den + 1e-6)
+
+    def state_index(self, y):
+        """Nearest state of each (clipped) target row y [N, 2] -> [N]."""
+        return ((y.clamp(-CLIP, CLIP)[:, None, :] - self.values[None]) ** 2).sum(-1).argmin(1)
+
+
 class GRUNet(nn.Module):
     """Stacked GRU (or LSTM with cell="lstm") + linear head. The recurrent module keeps the
-    attribute name `gru` for either cell so older checkpoints load unchanged."""
+    attribute name `gru` for either cell so older checkpoints load unchanged.
+    n_aux > 0 adds a training-only head for auxiliary targets (trainer.aux_targets) on the same hidden states:
+    forward() keeps the last top-layer output in `last_out` for it; the exported graph only has `head`."""
 
-    def __init__(self, hidden=128, layers=2, use_diff=False, dropout=0.0, cell="gru", n_extra=0):
+    def __init__(self, hidden=128, layers=2, use_diff=False, dropout=0.0, cell="gru", n_extra=0, feat_kind=None,
+                 n_aux=0, states=None):
         super().__init__()
         self.config = dict(hidden=hidden, layers=layers, use_diff=use_diff, dropout=dropout, cell=cell, n_extra=n_extra)
+        self.config.update({k: v for k, v in dict(feat_kind=feat_kind, n_aux=n_aux, states=states).items() if v})
         self.use_diff = use_diff
         self.cell = cell
         self.n_extra = n_extra  # extra causal features (pipeline/features.py), appended after the 112 inputs
+        self.feat_kind = feat_kind or (kind_for_width(n_extra) if n_extra else None)
         in_dim = N_FEATURES * (2 if use_diff else 1) + n_extra
         rnn = {"gru": nn.GRU, "lstm": nn.LSTM}[cell]
         self.gru = rnn(in_dim, hidden, layers, batch_first=True, dropout=dropout if layers > 1 else 0.0)
-        self.head = nn.Linear(hidden, 2)
+        self.head = StateHead(hidden, states) if states else nn.Linear(hidden, 2)  # states: joint-state head
+        self.aux_head = nn.Linear(hidden, n_aux) if n_aux else None
+        self.last_out = None
 
     def forward(self, x, h=None, x_prev=None):
         """x [B,T,112 (+ extras)]; h [L,B,H] or None; x_prev [B,>=112] = last row of the previous
@@ -55,6 +89,8 @@ class GRUNet(nn.Module):
             assert x.shape[-1] >= N_FEATURES + self.n_extra, "model needs the extra features as input"
             parts.append(x[..., N_FEATURES:N_FEATURES + self.n_extra])
         out, h = self.gru(torch.cat(parts, -1) if len(parts) > 1 else base, h)
+        if self.aux_head is not None:
+            self.last_out = out
         return self.head(out), h
 
 
@@ -78,11 +114,12 @@ class MinGRUNet(nn.Module):
     from the first step. State: one [B, H] tensor per layer."""
     BLOCK = 128  # scan block: keeps cumulative log-gates small enough for float32 (state is carried across blocks)
 
-    def __init__(self, hidden=192, layers=3, use_diff=False, dropout=0.0, n_extra=0):
+    def __init__(self, hidden=192, layers=3, use_diff=False, dropout=0.0, n_extra=0, feat_kind=None):
         super().__init__()
         self.config = dict(arch="mingru", hidden=hidden, layers=layers, use_diff=use_diff, dropout=dropout,
-                           n_extra=n_extra)
+                           n_extra=n_extra, **({"feat_kind": feat_kind} if feat_kind else {}))
         self.use_diff, self.n_extra, self.hidden = use_diff, n_extra, hidden
+        self.feat_kind = feat_kind or (kind_for_width(n_extra) if n_extra else None)
         in_dim = N_FEATURES * (2 if use_diff else 1) + n_extra
         self.proj = nn.ModuleList([nn.Linear(in_dim if l == 0 else hidden, 2 * hidden) for l in range(layers)])
         self.drop = nn.Dropout(dropout)
@@ -143,12 +180,13 @@ class TCNNet(nn.Module):
     each block ([B, pad_l, C]), zeros before the sequence start, so chunked training, evaluation and row-by-row
     inference see exactly the same context."""
 
-    def __init__(self, hidden=64, layers=11, use_diff=False, dropout=0.0, n_extra=0, kernel=2):
+    def __init__(self, hidden=64, layers=11, use_diff=False, dropout=0.0, n_extra=0, kernel=2, feat_kind=None):
         super().__init__()
         assert kernel >= 2, "TCN kernel must be >= 2"
         self.config = dict(arch="tcn", hidden=hidden, layers=layers, use_diff=use_diff, dropout=dropout,
-                           n_extra=n_extra, kernel=kernel)
+                           n_extra=n_extra, kernel=kernel, **({"feat_kind": feat_kind} if feat_kind else {}))
         self.use_diff, self.n_extra, self.hidden, self.kernel = use_diff, n_extra, hidden, kernel
+        self.feat_kind = feat_kind or (kind_for_width(n_extra) if n_extra else None)
         self.dilations = [kernel ** l for l in range(layers)]
         self.pads = [(kernel - 1) * d for d in self.dilations]
         in_dim = N_FEATURES * (2 if use_diff else 1) + n_extra
@@ -193,7 +231,67 @@ class TCNNet(nn.Module):
         return self.head(self.out_norm(z)), new
 
 
-ARCHS = {"gru": GRUNet, "mingru": MinGRUNet, "tcn": TCNNet}
+class GroupGRUNet(nn.Module):
+    """GRU conditioned on the instrument group. Input: the 112 features + the 4 detector probabilities g
+    (feature kind "grp"). The probabilities rescale and shift every input (FiLM: x * (1 + g G_scale) + g G_shift)
+    and mix 4 output heads (pred = sum_k g_k head_k(h)). G_scale / G_shift start at zero and all heads equal, so
+    `from_gru` gives exactly the plain GRU it starts from. The GRU layers are kept separate (one state per layer,
+    as in the exported plain GRU)."""
+    N_GROUPS = 4
+
+    def __init__(self, hidden=128, layers=2, dropout=0.0, n_extra=4, feat_kind="grp", use_diff=False):
+        super().__init__()
+        assert n_extra == self.N_GROUPS and feat_kind == "grp" and not use_diff
+        self.config = dict(arch="ggru", hidden=hidden, layers=layers, dropout=dropout, n_extra=n_extra,
+                           feat_kind=feat_kind, use_diff=False)
+        self.use_diff, self.n_extra, self.feat_kind, self.hidden = False, n_extra, feat_kind, hidden
+        self.film_scale = nn.Parameter(torch.zeros(self.N_GROUPS, N_FEATURES))
+        self.film_shift = nn.Parameter(torch.zeros(self.N_GROUPS, N_FEATURES))
+        self.layers = nn.ModuleList([nn.GRU(N_FEATURES if l == 0 else hidden, hidden, 1, batch_first=True)
+                                     for l in range(layers)])
+        self.drop = nn.Dropout(dropout)
+        self.heads = nn.Linear(hidden, 2 * self.N_GROUPS)
+
+    @torch.no_grad()
+    def from_gru(self, gru_state):
+        """Copy a plain GRUNet's weights (same hidden / layers, no extras): the result predicts exactly the same."""
+        for l, layer in enumerate(self.layers):
+            for n in ("weight_ih", "weight_hh", "bias_ih", "bias_hh"):
+                getattr(layer, f"{n}_l0").copy_(gru_state[f"gru.{n}_l{l}"])
+        self.heads.weight.copy_(gru_state["head.weight"].repeat(self.N_GROUPS, 1))
+        self.heads.bias.copy_(gru_state["head.bias"].repeat(self.N_GROUPS))
+        return self
+
+    def _mix(self, out, g):
+        heads = self.heads(out).unflatten(-1, (self.N_GROUPS, 2))  # [..., 4, 2]
+        return (heads * g.unsqueeze(-1)).sum(-2)
+
+    def _film(self, x):
+        base, g = x[..., :N_FEATURES], x[..., N_FEATURES:N_FEATURES + self.N_GROUPS]
+        return base * (1 + g @ self.film_scale) + g @ self.film_shift, g
+
+    def forward(self, x, h=None, x_prev=None):
+        z, g = self._film(x)
+        h = h if h is not None else [None] * len(self.layers)
+        new = []
+        for l, layer in enumerate(self.layers):
+            z, hl = layer(self.drop(z) if l else z, h[l])
+            new.append(hl)
+        return self._mix(z, g), new
+
+    def stream_states(self):
+        return [(f"h{l}", (1, 1, self.hidden)) for l in range(len(self.layers))]
+
+    def stream_step(self, x, states):
+        z, g = self._film(x)
+        new = []
+        for layer, hl in zip(self.layers, states):
+            z, hn = layer(z, hl)
+            new.append(hn)
+        return self._mix(z, g), new
+
+
+ARCHS = {"gru": GRUNet, "mingru": MinGRUNet, "tcn": TCNNet, "ggru": GroupGRUNet}
 
 
 def build_net(config):
@@ -205,6 +303,14 @@ def build_net(config):
 def needs_extra(net):
     members = list(net.nets) if isinstance(net, EnsembleNet) else [net]
     return max(getattr(m, "n_extra", 0) for m in members)
+
+
+def feat_kind(net):
+    """The feature kind a model (or every member of an ensemble) takes as extra inputs; None = plain 112."""
+    members = list(net.nets) if isinstance(net, EnsembleNet) else [net]
+    kinds = {getattr(m, "feat_kind", None) for m in members}
+    assert len(kinds - {None}) <= 1, f"members use different feature kinds: {kinds}"
+    return max(kinds - {None}, default=None)
 
 
 def detach_state(h):
@@ -219,17 +325,20 @@ def macs(config) -> int:
     if "members" in config:
         return sum(macs(m) for m in config["members"])
     arch = config.get("arch", "gru")
-    H, n_in = config["hidden"], N_FEATURES * (2 if config["use_diff"] else 1)
+    H, n_in = config["hidden"], N_FEATURES * (2 if config["use_diff"] else 1) + config.get("n_extra", 0)
     if arch == "mingru":  # one [in -> 2H] projection per layer
         return sum(2 * H * (n_in if l == 0 else H) for l in range(config["layers"])) + 2 * H
     if arch == "tcn":  # input projection, per block a k-tap conv + 1x1 mix (LayerNorms ignored)
         return n_in * H + config["layers"] * (config["kernel"] + 1) * H * H + 2 * H
     gates = 4 if config.get("cell", "gru") == "lstm" else 3
     total = 0
+    if arch == "ggru":  # FiLM (2 x 4 x 112) + 4 heads on top of a plain GRU on the 112 inputs
+        n_in = N_FEATURES
+        total = 2 * 4 * N_FEATURES + 6 * H
     for _ in range(config["layers"]):
         total += gates * H * (n_in + H)
         n_in = H
-    return total + 2 * H
+    return total + (len(config["states"]) * (H + 4) if config.get("states") else 2 * H)
 
 
 BASELINE_MACS = macs(dict(hidden=128, layers=2, use_diff=False))  # 190,720
@@ -382,6 +491,7 @@ def export_onnx(net, path: str):
     (h{l} / c{l} for GRU/LSTM and minGRU, b{l} for TCN buffers); outputs: pred, then the new states in the same
     order. All states start at zero (solution.py zero-fills them from the graph's input shapes)."""
     net = net.eval().cpu()
+    feat_kind(net)  # raises if ensemble members need different extra features
     names = state_names(net)
     members = list(net.nets) if isinstance(net, EnsembleNet) else [net]
     states = [torch.zeros(*shape) for m in members for _, shape in _member_states(m)]

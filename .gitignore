@@ -5,3 +5,4 @@ __pycache__/
 .DS_Store
 *.tar.gz
 runs/reservoir_B_preds.npy
+zips/

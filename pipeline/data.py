@@ -74,3 +74,46 @@ def split_train(n_seqs: int, n_holdout: int, seed: int = 0):
     """Deterministic split of train row groups into (train_ids, holdout_ids)."""
     perm = np.random.default_rng(seed).permutation(n_seqs)
     return np.sort(perm[n_holdout:]), np.sort(perm[:n_holdout])
+
+
+VOFF = 1_000_000  # pool keys: train sequence i -> i; validation sequence v (copy c) -> VOFF * (c + 1) + v
+
+
+def valid_key(v, copy=0):
+    return VOFF * (copy + 1) + v
+
+
+class PoolStore:
+    """Training sequences from train.parquet and valid.parquet in one stream, addressed by pool keys (VOFF).
+    The validation part is kept in RAM after its first read (~9 MB per sequence)."""
+
+    def __init__(self, train: SeqStore, valid: SeqStore):
+        self.train, self.valid = train, valid
+        self.valid.enable_cache()
+        self._pool = train._pool
+
+    def _load_into(self, i, key, X, Y, M):
+        key = int(key)
+        if key < VOFF:
+            self.train._load_into(i, key, X, Y, M)
+        else:
+            self.valid._load_into(i, key % VOFF, X, Y, M)
+
+    def load(self, keys):
+        B = len(keys)
+        X = np.empty((B, SEQUENCE_LENGTH, N_FEATURES), np.float32)
+        Y = np.empty((B, SEQUENCE_LENGTH, 2), np.float32)
+        M = np.empty((B, SEQUENCE_LENGTH), bool)
+        list(self._pool.map(lambda ik: self._load_into(ik[0], ik[1], X, Y, M), enumerate(keys)))
+        return X, Y, M
+
+    batches = SeqStore.batches
+
+
+def take_rows(mm, idx):
+    """Rows idx of a (memmapped) array, in idx order, read in file order -> float32."""
+    idx = np.asarray(idx, np.int64)
+    out = np.empty((len(idx),) + mm.shape[1:], np.float32)
+    o = np.argsort(idx)
+    out[o] = mm[idx[o]]
+    return out
